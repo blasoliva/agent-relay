@@ -1,0 +1,14 @@
+# Named "postgres" so it matches RELAY_DATABASE_URL's host in the relay
+# deployment (Kubernetes' in-cluster DNS resolves service names).
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: agent-relay
+spec:
+  selector:
+    app: postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  # ClusterIP (default): reachable only from inside the cluster.

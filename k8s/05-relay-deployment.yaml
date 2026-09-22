@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  namespace: agent-relay
+  labels:
+    app: relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: relay
+  template:
+    metadata:
+      labels:
+        app: relay
+    spec:
+      # Kubernetes Deployments have no `depends_on: service_healthy` like
+      # compose.yaml's. main.py connects to Postgres at import time (before
+      # the readiness probe even starts), so without this the pod
+      # crash-loops until Postgres happens to be up.
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:16-alpine
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432 -U "$POSTGRES_USER"; do
+                echo "waiting for postgres..."
+                sleep 2
+              done
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+      containers:
+        - name: relay
+          # Built locally (see Dockerfile) and loaded into the kind node with
+          # `kind load docker-image agent-relay:local --name agent-relay`;
+          # never pulled from a registry.
+          image: agent-relay:local
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - secretRef:
+                name: postgres-credentials
+          env:
+            # Kubernetes expands $(VAR) against envFrom/earlier env entries in
+            # the same container, so this composes the DSN from the secret's
+            # values without duplicating the credentials here.
+            - name: RELAY_DATABASE_URL
+              value: postgresql+psycopg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres:5432/$(POSTGRES_DB)
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi

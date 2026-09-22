@@ -1,0 +1,15 @@
+# NodePort 30080 is mapped to the host's port 8000 by kind-config.yaml's
+# extraPortMappings, so http://localhost:8000 reaches this service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay
+  namespace: agent-relay
+spec:
+  type: NodePort
+  selector:
+    app: relay
+  ports:
+    - port: 8000
+      targetPort: 8000
+      nodePort: 30080

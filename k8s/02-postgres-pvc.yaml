@@ -1,0 +1,13 @@
+# Uses the cluster's default StorageClass (kind ships local-path-provisioner
+# as "standard"). Data survives pod restarts/reschedules on the same node.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: agent-relay
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
