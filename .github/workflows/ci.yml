@@ -1,0 +1,77 @@
+name: CI
+
+# The deploy job talks to a kind cluster and the host's Docker daemon, so it
+# only makes sense against a machine that already has both — i.e. run
+# locally with `act`, not on a hosted GitHub runner.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: agent_relay
+          POSTGRES_PASSWORD: agent_relay
+          POSTGRES_DB: agent_relay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agent_relay -d agent_relay_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The starter's suite (test_agent_relay.py) picks this up directly;
+      # it exercises the same protocol/storage code the deployed image runs.
+      RELAY_DATABASE_URL: postgresql+psycopg://agent_relay:agent_relay@localhost:5432/agent_relay_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests against PostgreSQL
+        run: uv run pytest -v
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute a unique image tag
+        id: image
+        run: |
+          sha="$(git rev-parse --short=12 HEAD)"
+          tag="${sha}-$(date +%s)"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Building agent-relay:${tag}"
+
+      - name: Install kind and kubectl
+        run: |
+          curl -sSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64"
+          chmod +x /usr/local/bin/kind
+          curl -sSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.37.0/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kubectl
+
+      - name: Point kubectl at the local kind cluster
+        run: kind export kubeconfig --name agent-relay
+
+      - name: Build the image
+        run: docker build -t "agent-relay:${{ steps.image.outputs.tag }}" .
+
+      - name: Load the image into kind
+        run: kind load docker-image "agent-relay:${{ steps.image.outputs.tag }}" --name agent-relay
+
+      - name: Deploy and wait for the rollout
+        run: |
+          kubectl -n agent-relay set image deployment/relay "relay=agent-relay:${{ steps.image.outputs.tag }}"
+          kubectl -n agent-relay rollout status deployment/relay --timeout=180s
