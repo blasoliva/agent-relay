@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient
 import main
 from database import Attempt, Base, Task, as_db_time, db_session, engine, utcnow
 from storage import claim_one
+from worker import load_credentials, save_credentials
 
 
 @pytest.fixture(autouse=True)
@@ -150,6 +151,54 @@ def test_expiry_requeues_and_old_token_is_stale_before_recovery():
         assert second.status_code == 200
         assert second.json()["attempt"] == 2
         assert second.json()["claim_token"] != first["claim_token"]
+
+
+def test_task_stays_queued_until_worker_starts_with_saved_credentials(tmp_path):
+    # SPEC.md acceptance scenario 2: register an agent without starting a
+    # worker, confirm its task sits queued, then confirm a worker process
+    # picking up saved credentials from disk can claim and complete it.
+    with TestClient(main.app) as client:
+        recipient, _recipient_headers = register(client, "recipient-no-worker")
+        credentials_path = tmp_path / "credentials.json"
+        save_credentials(credentials_path, {"agent_id": recipient["agent_id"], "token": recipient["token"]})
+
+        sender, sender_headers = register(client, "sender")
+        task = client.post(
+            "/api/v1/tasks",
+            headers=sender_headers,
+            json={"to": recipient["agent_id"], "input": "scenario 2 payload"},
+        )
+        assert task.status_code == 201
+        task_id = task.json()["task_id"]
+
+        queued = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+        assert queued["status"] == "queued"
+        assert queued["attempt_count"] == 0
+
+        loaded = load_credentials(credentials_path)
+        assert loaded == {"agent_id": recipient["agent_id"], "token": recipient["token"]}
+        worker_headers = {"Authorization": f"Bearer {loaded['token']}"}
+
+        claim = client.post(
+            "/api/v1/tasks/claim",
+            headers=worker_headers,
+            json={"worker_id": "scenario2-worker", "wait_seconds": 0},
+        )
+        assert claim.status_code == 200
+        claim_data = claim.json()
+        assert claim_data["attempt"] == 1
+
+        complete = client.post(
+            f"/api/v1/tasks/{task_id}/complete",
+            headers=worker_headers,
+            json={"claim_token": claim_data["claim_token"], "output": claim_data["input"].upper()},
+        )
+        assert complete.status_code == 200
+
+        final = client.get(f"/api/v1/tasks/{task_id}", headers=sender_headers).json()
+        assert final["status"] == "completed"
+        assert final["output"] == "SCENARIO 2 PAYLOAD"
+        assert final["attempt_count"] == 1
 
 
 def test_dashboard_is_asset_and_invalid_input_is_documented_error():
