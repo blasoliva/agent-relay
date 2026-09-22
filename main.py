@@ -1,6 +1,6 @@
 """FastAPI routes for Agent Relay.
 
-Persistence and SQLite transaction details live in :mod:`database` and
+Persistence and PostgreSQL transaction details live in :mod:`database` and
 :mod:`storage`; the deterministic local worker is in :mod:`worker`.
 """
 
@@ -20,7 +20,6 @@ from fastapi import Depends, FastAPI, Header, Path as FastAPIPath, Query, Reques
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from sqlalchemy import text
-from sqlalchemy.exc import OperationalError
 
 from database import (
     DEFAULT_PAGE_SIZE,
@@ -152,16 +151,22 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _check_ready() -> None:
+    with db_session() as db:
+        # Check real tables, not just connectivity: after a volume wipe
+        # or failed migration the DB can answer SELECT 1 while every
+        # write 500s with "no such table". Missing tables -> 503.
+        db.execute(text("SELECT 1 FROM agents LIMIT 1"))
+        db.execute(text("SELECT 1 FROM tasks LIMIT 1"))
+        db.execute(text("SELECT 1 FROM attempts LIMIT 1"))
+
+
 @app.get("/ready")
 async def ready() -> JSONResponse:
     try:
-        with db_session() as db:
-            # Check real tables, not just connectivity: after a volume wipe
-            # or failed migration the DB can answer SELECT 1 while every
-            # write 500s with "no such table". Missing tables -> 503.
-            db.execute(text("SELECT 1 FROM agents LIMIT 1"))
-            db.execute(text("SELECT 1 FROM tasks LIMIT 1"))
-            db.execute(text("SELECT 1 FROM attempts LIMIT 1"))
+        # Off the event loop: a slow/unreachable database must not also
+        # stall /health and every other in-flight request on this process.
+        await asyncio.to_thread(_check_ready)
     except Exception:
         return JSONResponse(status_code=503, content={"status": "not_ready"})
     return JSONResponse(status_code=200, content={"status": "ready"})
@@ -186,7 +191,7 @@ async def agents(
 ) -> dict[str, Any]:
     del current
     limit, decoded = page_params(limit, cursor)
-    rows, next_cursor = list_agents(limit, decoded)
+    rows, next_cursor = await asyncio.to_thread(list_agents, limit, decoded)
     return {"items": [agent_summary(row) for row in rows], "next_cursor": next_cursor}
 
 
@@ -205,15 +210,8 @@ async def tasks_create(
         not idempotency_key.strip() or len(idempotency_key) > 255 or "\x00" in idempotency_key
     ):
         raise RelayError("invalid_input", "Idempotency-Key must be nonempty and at most 255 characters.", 400)
-    for retry in range(3):
-        try:
-            result = create_task(current.id, body.to, body.input, idempotency_key)
-            return JSONResponse(status_code=201, content=result)
-        except OperationalError as exc:
-            if retry == 2 or "locked" not in str(exc).lower():
-                raise
-            await asyncio.sleep(0.05 * (retry + 1))
-    raise RelayError("storage_error", "The task could not be persisted.", 503)
+    result = await asyncio.to_thread(create_task, current.id, body.to, body.input, idempotency_key)
+    return JSONResponse(status_code=201, content=result)
 
 
 @app.post("/api/v1/tasks/claim")
@@ -223,12 +221,7 @@ async def claim(
 ) -> Response:
     deadline = time.monotonic() + body.wait_seconds
     while True:
-        try:
-            result = await asyncio.to_thread(claim_one, current.id, body.worker_id)
-        except OperationalError as exc:
-            if "locked" not in str(exc).lower():
-                raise
-            result = None
+        result = await asyncio.to_thread(claim_one, current.id, body.worker_id)
         if result is not None:
             return JSONResponse(status_code=200, content=result)
         remaining = deadline - time.monotonic()
@@ -246,7 +239,8 @@ async def task_heartbeat(
     task_id: str = FastAPIPath(..., min_length=1, max_length=100),
     current=Depends(current_agent),
 ) -> dict[str, str]:
-    return {"lease_expires_at": heartbeat(task_id, current.id, body.claim_token)}
+    lease_expires_at = await asyncio.to_thread(heartbeat, task_id, current.id, body.claim_token)
+    return {"lease_expires_at": lease_expires_at}
 
 
 @app.post("/api/v1/tasks/{task_id}/complete")
@@ -255,7 +249,9 @@ async def task_complete(
     task_id: str = FastAPIPath(..., min_length=1, max_length=100),
     current=Depends(current_agent),
 ) -> dict[str, str]:
-    return commit_terminal(task_id, current.id, body.claim_token, action="complete", value=body.output)
+    return await asyncio.to_thread(
+        commit_terminal, task_id, current.id, body.claim_token, action="complete", value=body.output
+    )
 
 
 @app.post("/api/v1/tasks/{task_id}/fail")
@@ -264,7 +260,9 @@ async def task_fail(
     task_id: str = FastAPIPath(..., min_length=1, max_length=100),
     current=Depends(current_agent),
 ) -> dict[str, str]:
-    return commit_terminal(task_id, current.id, body.claim_token, action="fail", value=body.error)
+    return await asyncio.to_thread(
+        commit_terminal, task_id, current.id, body.claim_token, action="fail", value=body.error
+    )
 
 
 @app.get("/api/v1/tasks/{task_id}")
@@ -272,7 +270,8 @@ async def task_get(
     task_id: str = FastAPIPath(..., min_length=1, max_length=100),
     current=Depends(current_agent),
 ) -> dict[str, Any]:
-    return task_summary(task_for_participant(task_id, current.id))
+    task = await asyncio.to_thread(task_for_participant, task_id, current.id)
+    return task_summary(task)
 
 
 @app.get("/api/v1/tasks")
@@ -286,7 +285,7 @@ async def task_list(
     if status is not None and status not in {"queued", "processing", "completed", "failed"}:
         raise RelayError("invalid_input", "status is invalid.", 400)
     limit, decoded = page_params(limit, cursor)
-    rows, next_cursor = list_tasks(current.id, direction, status, limit, decoded)
+    rows, next_cursor = await asyncio.to_thread(list_tasks, current.id, direction, status, limit, decoded)
     return {"items": [task_summary(row) for row in rows], "next_cursor": next_cursor}
 
 
@@ -295,7 +294,8 @@ async def task_attempts(
     task_id: str = FastAPIPath(..., min_length=1, max_length=100),
     current=Depends(current_agent),
 ) -> dict[str, Any]:
-    return {"items": [attempt_summary(row) for row in attempts_for_participant(task_id, current.id)]}
+    rows = await asyncio.to_thread(attempts_for_participant, task_id, current.id)
+    return {"items": [attempt_summary(row) for row in rows]}
 
 
 @app.get("/", response_class=HTMLResponse)
